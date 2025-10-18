@@ -1,87 +1,127 @@
 jQuery(document).ready(function($) {
-    let captureTimeout = null;
-    let lastCapturedData = null;
+    'use strict';
 
-    // Función para capturar el carrito con todos los datos
-    function captureCart() {
-        // Recopilar todos los campos de billing del formulario
-        const billingData = {
-            action: 'wse_pro_capture_cart',
-            nonce: wseProCapture.nonce,
-            billing_email: $('#billing_email').val() || '',
-            billing_phone: $('#billing_phone').val() || '',
-            billing_first_name: $('#billing_first_name').val() || '',
-            billing_last_name: $('#billing_last_name').val() || '',
-            billing_address_1: $('#billing_address_1').val() || '',
-            billing_city: $('#billing_city').val() || '',
-            billing_state: $('#billing_state').val() || '',
-            billing_postcode: $('#billing_postcode').val() || '',
-            billing_country: $('#billing_country').val() || ''
-        };
-
-        // Verificar si hay al menos email o teléfono
-        if (!billingData.billing_email && !billingData.billing_phone) {
-            return;
-        }
-
-        // Crear un hash de los datos para comparar
-        const dataHash = JSON.stringify(billingData);
-        
-        // Solo enviar si los datos han cambiado
-        if (dataHash === lastCapturedData) {
-            return;
-        }
-
-        // Enviar datos vía AJAX
+    // Función para enviar los datos al servidor (es la misma para ambos métodos)
+    function sendCaptureRequest(data, lastHash) {
         $.ajax({
             url: wseProCapture.ajax_url,
             type: 'POST',
-            data: billingData,
+            data: data,
             success: function(response) {
                 if (response.success && response.data.captured) {
-                    lastCapturedData = dataHash;
-                    console.log('Carrito capturado exitosamente');
+                    lastHash.data = JSON.stringify(data); // Actualizar el hash
+                    console.log('WooWApp: Carrito capturado (Universal)', response.data.cart_id);
                 }
             },
             error: function(xhr, status, error) {
-                console.error('Error al capturar carrito:', error);
+                console.error('WooWApp: Error al capturar carrito:', error);
             }
         });
     }
 
-    // Función para programar captura con debounce
-    function scheduleCapture() {
-        clearTimeout(captureTimeout);
-        captureTimeout = setTimeout(captureCart, 2000); // Esperar 2 segundos después del último cambio
+    // --- LÓGICA PARA CHECKOUT TRADICIONAL (CON JQUERY) ---
+    function initTraditionalCheckoutCapture() {
+        console.log('WooWApp: Detectado Checkout Tradicional');
+        let captureTimeout = null;
+        let lastCapturedData = { data: null }; // Usamos un objeto para pasarlo por referencia
+
+        function captureCart() {
+            var formData = $('form.checkout').serialize();
+            formData += '&action=wse_pro_capture_cart';
+            formData += '&nonce=' + wseProCapture.nonce;
+
+            if (formData.indexOf('billing_email=') === -1 && formData.indexOf('billing_phone=') === -1) {
+                return;
+            }
+
+            if (formData === lastCapturedData.data) {
+                return; // No ha cambiado
+            }
+            
+            // Enviar datos (formato de cadena)
+            sendCaptureRequest(formData, lastCapturedData);
+        }
+
+        function scheduleCapture() {
+            clearTimeout(captureTimeout);
+            captureTimeout = setTimeout(captureCart, 2000); // 2 segundos de espera
+        }
+
+        $(document).on('input change', 'form.checkout input, form.checkout select', scheduleCapture);
+        $(document.body).on('updated_checkout', scheduleCapture);
     }
 
-    // Escuchar cambios en campos de billing
-    const billingFields = [
-        '#billing_email',
-        '#billing_phone',
-        '#billing_first_name',
-        '#billing_last_name',
-        '#billing_address_1',
-        '#billing_city',
-        '#billing_state',
-        '#billing_postcode',
-        '#billing_country'
-    ];
-
-    // Agregar listener a cada campo
-    billingFields.forEach(function(selector) {
-        $(document).on('change blur', selector, scheduleCapture);
-    });
-
-    // También capturar cuando se actualiza el checkout
-    $(document.body).on('updated_checkout', function() {
-        scheduleCapture();
-    });
-
-    // Captura inicial después de 3 segundos si hay datos
-    setTimeout(function() {
-        if ($('#billing_email').val() || $('#billing_phone').val()) {
-            captureCart();
+    // --- LÓGICA PARA CHECKOUT DE BLOQUES (CON API DE WOOCOMMERCE) ---
+    function initBlockCheckoutCapture() {
+        console.log('WooWApp: Detectado Checkout de Bloques');
+        
+        // Verificar que la API de bloques de Woo exista
+        if (typeof wc === 'undefined' || typeof wc.data === 'undefined' || typeof wc.blocksData === 'undefined') {
+            console.warn('WooWApp: wc.data o wc.blocksData no está disponible. Reintentando...');
+            setTimeout(initBlockCheckoutCapture, 500); // Reintentar
+            return;
         }
-    }, 3000);
+
+        let captureTimeout = null;
+        let lastCapturedData = { data: null }; // Usamos un objeto
+        const { select, subscribe } = wc.data;
+        const CHECKOUT_STORE_KEY = wc.blocksData.CHECKOUT_STORE_KEY;
+
+        // Nos "subscribimos" a cualquier cambio en los datos del checkout
+        subscribe(function() {
+            // Esta función se dispara CADA VEZ que el usuario teclea una letra.
+            // Es crucial usar un "debounce" (retraso) para no colapsar el servidor.
+            
+            clearTimeout(captureTimeout);
+            captureTimeout = setTimeout(function() {
+                
+                // Obtenemos los datos de facturación de la "tienda" de datos de Woo
+                const billingAddress = select(CHECKOUT_STORE_KEY).getBillingAddress();
+
+                if (!billingAddress.email && !billingAddress.phone) {
+                    return; // No hay datos mínimos
+                }
+
+                // Mapeamos los datos al formato que nuestro PHP espera (ej. 'billing_phone')
+                const postData = {
+                    action: 'wse_pro_capture_cart',
+                    nonce: wseProCapture.nonce,
+                    billing_first_name: billingAddress.first_name || '',
+                    billing_last_name: billingAddress.last_name || '',
+                    billing_email: billingAddress.email || '',
+                    billing_phone: billingAddress.phone || '',
+                    billing_address_1: billingAddress.address_1 || '',
+                    billing_address_2: billingAddress.address_2 || '',
+                    billing_city: billingAddress.city || '',
+                    billing_state: billingAddress.state || '',
+                    billing_postcode: billingAddress.postcode || '',
+                    billing_country: billingAddress.country || '',
+                    billing_company: billingAddress.company || ''
+                };
+                
+                const dataHash = JSON.stringify(postData);
+                if (dataHash === lastCapturedData.data) {
+                    return; // No ha cambiado
+                }
+
+                // Enviar datos (formato de objeto)
+                sendCaptureRequest(postData, lastCapturedData);
+
+            }, 2000); // 2 segundos de espera después de la última tecla
+        });
+    }
+
+    // --- DETECCIÓN E INICIO ---
+    // Esperamos un momento para que la página (especialmente los bloques) termine de cargar
+    setTimeout(function() {
+        if ($('.wc-block-checkout').length > 0) {
+            // Si existe la clase .wc-block-checkout, usamos la lógica de Bloques
+            initBlockCheckoutCapture();
+        } else if ($('form.checkout').length > 0) {
+            // Si existe form.checkout, usamos la lógica Tradicional
+            initTraditionalCheckoutCapture();
+        } else {
+            console.warn('WooWApp: No se pudo detectar un formulario de checkout conocido.');
+        }
+    }, 500);
 });
