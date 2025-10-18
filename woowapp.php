@@ -528,26 +528,19 @@ final class WooWApp {
         
         global $wpdb;
         
-        $billing_data = [
-            'billing_email'      => isset($_POST['billing_email']) ? sanitize_email($_POST['billing_email']) : '',
-            'billing_phone'      => isset($_POST['billing_phone']) ? sanitize_text_field($_POST['billing_phone']) : '',
-            'billing_first_name' => isset($_POST['billing_first_name']) ? sanitize_text_field($_POST['billing_first_name']) : '',
-            'billing_last_name'  => isset($_POST['billing_last_name']) ? sanitize_text_field($_POST['billing_last_name']) : '',
-            'billing_address_1'  => isset($_POST['billing_address_1']) ? sanitize_text_field($_POST['billing_address_1']) : '',
-            'billing_city'       => isset($_POST['billing_city']) ? sanitize_text_field($_POST['billing_city']) : '',
-            'billing_state'      => isset($_POST['billing_state']) ? sanitize_text_field($_POST['billing_state']) : '',
-            'billing_postcode'   => isset($_POST['billing_postcode']) ? sanitize_text_field($_POST['billing_postcode']) : '',
-            'billing_country'    => isset($_POST['billing_country']) ? sanitize_text_field($_POST['billing_country']) : '',
-        ];
-        
-        if (empty($billing_data['billing_email']) && empty($billing_data['billing_phone'])) {
-            wp_send_json_success(['captured' => false]);
+        // 1. Validar campos clave (email o teléfono)
+        // Usamos los nombres estándar de WooCommerce, que casi nunca cambian.
+        $phone = isset($_POST['billing_phone']) ? sanitize_text_field(wp_unslash($_POST['billing_phone'])) : '';
+        $email = isset($_POST['billing_email']) ? sanitize_email(wp_unslash($_POST['billing_email'])) : '';
+
+        if (empty($email) && empty($phone)) {
+            wp_send_json_error(['message' => 'Email y Teléfono vacíos.']);
             return;
         }
         
         $cart = WC()->cart;
         if (!$cart || $cart->is_empty()) {
-            wp_send_json_success(['captured' => false]);
+            wp_send_json_error(['message' => 'Carrito vacío.']);
             return;
         }
         
@@ -557,27 +550,68 @@ final class WooWApp {
         $cart_total = $cart->get_total('edit');
         $current_time = current_time('mysql');
         
+        // 2. Definir datos base del carrito
+        $cart_data = [
+            'user_id'         => $user_id,
+            'session_id'      => $session_id,
+            'first_name'      => isset($_POST['billing_first_name']) ? sanitize_text_field(wp_unslash($_POST['billing_first_name'])) : '',
+            'phone'           => $phone, // Columna 'phone' principal
+            'cart_contents'   => $cart_contents,
+            'cart_total'      => $cart_total,
+            'updated_at'      => $current_time,
+            'messages_sent'   => '0,0,0'
+        ];
+        
+        // 3. Formato de datos base para $wpdb
+        $format = [
+            '%d', // user_id
+            '%s', // session_id
+            '%s', // first_name
+            '%s', // phone
+            '%s', // cart_contents
+            '%f', // cart_total
+            '%s', // updated_at
+            '%s'  // messages_sent
+        ];
+        
+        // 4. Captura DINÁMICA de todos los campos de billing
+        // Obtenemos las columnas de la BD para asegurarnos de que existan
+        $table_columns = $this->get_table_columns_static(); 
+        
+        $all_post_data = [];
+
+        foreach ($_POST as $key => $value) {
+            // Guardar todo (excepto action/nonce) para la columna 'checkout_data'
+            if ($key !== 'action' && $key !== 'nonce') {
+                $all_post_data[$key] = sanitize_text_field(wp_unslash($value));
+            }
+            
+            // Si el campo POST existe como una columna en la tabla (ej: billing_email, billing_city)
+            if (strpos($key, 'billing_') === 0 && array_key_exists($key, $table_columns)) {
+                if (!isset($cart_data[$key])) { // Evitar duplicar los que ya pusimos
+                    $cart_data[$key] = sanitize_text_field(wp_unslash($value));
+                    $format[] = '%s';
+                }
+            }
+        }
+
+        // 5. Guardar TODOS los datos del formulario serializados
+        // Esto es una salvaguarda para la restauración
+        $cart_data['checkout_data'] = maybe_serialize($all_post_data);
+        $format[] = '%s';
+
+        // 6. Lógica de Insertar o Actualizar
         $existing_cart = $wpdb->get_row($wpdb->prepare(
-            "SELECT id FROM " . self::$abandoned_cart_table_name . " 
+            "SELECT * FROM " . self::$abandoned_cart_table_name . " 
              WHERE session_id = %s AND status = 'active'",
             $session_id
         ));
         
-        $cart_data = array_merge([
-            'user_id'         => $user_id,
-            'session_id'      => $session_id,
-            'first_name'      => $billing_data['billing_first_name'],
-            'phone'           => $billing_data['billing_phone'],
-            'cart_contents'   => $cart_contents,
-            'cart_total'      => $cart_total,
-            'checkout_data'   => '',
-            'updated_at'      => $current_time,
-            'messages_sent'   => '0,0,0'
-        ], $billing_data);
-        
-        $format = ['%d', '%s', '%s', '%s', '%s', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s'];
-
         if ($existing_cart) {
+            // Si ya existe un carrito, actualizamos los datos de billing/checkout
+            // PERO mantenemos los mensajes enviados originales
+            $cart_data['messages_sent'] = $existing_cart->messages_sent;
+            
             $wpdb->update(
                 self::$abandoned_cart_table_name,
                 $cart_data,
@@ -587,10 +621,11 @@ final class WooWApp {
             );
             $cart_id = $existing_cart->id;
         } else {
+            // Es un carrito nuevo, lo insertamos
             $cart_data['created_at'] = $current_time;
             $cart_data['recovery_token'] = bin2hex(random_bytes(16));
-            $format[] = '%s';
-            $format[] = '%s';
+            $format[] = '%s'; // created_at
+            $format[] = '%s'; // recovery_token
             
             $wpdb->insert(
                 self::$abandoned_cart_table_name,
@@ -1857,11 +1892,31 @@ public function send_review_thank_you_message($order) {
             wc_get_logger()->error($message, ['source' => 'woowapp-' . date('Y-m-d')]);
         }
     }
-}
 
+    /**
+     * Función auxiliar estática para obtener columnas de la tabla
+     * Esto ayuda a la función de captura a saber qué campos guardar.
+     */
+    private static function get_table_columns_static() {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'wse_pro_abandoned_carts';
+        // Usar un caché simple para evitar múltiples consultas a la BD
+        static $columns = null;
+        if ($columns === null) {
+            $columns_data = $wpdb->get_col("DESC $table_name");
+            if (empty($columns_data)) {
+                 $columns = [];
+            } else {
+                 $columns = array_flip($columns_data);
+            }
+        }
+        return $columns;
+    }
+
+} // <-- ESTA ES LA ÚLTIMA LLAVE DE LA CLASE WOOAPP
+    
 // Inicializar el plugin
 WooWApp::get_instance();
-
 
 
 
